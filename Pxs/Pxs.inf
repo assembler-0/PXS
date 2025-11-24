@@ -17,6 +17,16 @@
   UefiApplicationEntryPoint
   UefiLib
   BaseLib
+  BaseMemoryLib
+  MemoryAllocationLib
 
 [Protocols]
   gEfiGraphicsOutputProtocolGuid
+  gEfiSimpleFileSystemProtocolGuid
+  gEfiLoadedImageProtocolGuid
+
+[Guids]
+  gEfiFileInfoGuid
+  gEfiAcpi20TableGuid
+  gEfiAcpi10TableGuid
+  gEfiSmbiosTableGuid
