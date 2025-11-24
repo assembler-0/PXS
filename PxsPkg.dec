@@ -1,0 +1,8 @@
+[Defines]
+  DEC_SPECIFICATION              = 0x00010005
+  PACKAGE_NAME                   = PxsPkg
+  PACKAGE_GUID                   = 87654321-4321-4321-4321-210987654321
+  PACKAGE_VERSION                = 0.0.1
+
+[Includes]
+  Pxs/include

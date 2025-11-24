@@ -1,0 +1,22 @@
+[Defines]
+  INF_VERSION                    = 0x00010005
+  BASE_NAME                      = Pxs
+  FILE_GUID                      = 12345678-1234-1234-1234-123456789012
+  MODULE_TYPE                    = UEFI_APPLICATION
+  VERSION_STRING                 = 0.0.1
+  ENTRY_POINT                    = UefiMain
+
+[Sources]
+  arch/x64/efi/Pxs.c
+
+[Packages]
+  MdePkg/MdePkg.dec
+  PxsPkg/PxsPkg.dec
+
+[LibraryClasses]
+  UefiApplicationEntryPoint
+  UefiLib
+  BaseLib
+
+[Protocols]
+  gEfiGraphicsOutputProtocolGuid
