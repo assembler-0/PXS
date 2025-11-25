@@ -21,13 +21,14 @@
 #define DEFAULT_CONFIG_PATH L"pxs.cfg"
 
 // Kernel Entry Point Type
-typedef VOID (*KERNEL_ENTRY)(PXS_BOOT_INFO *BootInfo);
+typedef VOID (__sysv_abi *KERNEL_ENTRY)(PXS_BOOT_INFO *BootInfo);
 
 typedef struct {
     CHAR16 KernelPath[256];
     CHAR16 InitrdPath[256];
     CHAR8  CmdLine[512];
     UINTN  Timeout;
+    BOOLEAN KaslrEnabled;
 } PXS_CONFIG;
 
 // --------------------------------------------------------------------------
@@ -144,6 +145,7 @@ VOID LoadConfig(
     Config->InitrdPath[0] = L'\0';
     Config->CmdLine[0] = '\0';
     Config->Timeout = 3;
+    Config->KaslrEnabled = TRUE;
 
     Status = LoadFile(RootDir, ConfigName, &Buffer, &Size);
     if (EFI_ERROR(Status)) {
@@ -163,6 +165,11 @@ VOID LoadConfig(
 
         // Process line [Start, End)
         if (End > Start) {
+            // Skip leading whitespace
+            while (Start < End && (AsciiBuffer[Start] == ' ' || AsciiBuffer[Start] == '\t')) {
+                Start++;
+            }
+
             // Check for KERNEL=
             if (AsciiStrnCmp(&AsciiBuffer[Start], "KERNEL=", 7) == 0) {
                 UINTN ValStart = Start + 7;
@@ -206,6 +213,16 @@ VOID LoadConfig(
                 }
                 Config->Timeout = TimeoutVal;
             }
+            // Check for KASLR=
+            else if (AsciiStrnCmp(&AsciiBuffer[Start], "KASLR=", 6) == 0) {
+                UINTN ValStart = Start + 6;
+                // Check for 0 or FALSE
+                if (AsciiBuffer[ValStart] == '0') {
+                    Config->KaslrEnabled = FALSE;
+                } else if (AsciiStrnCmp(&AsciiBuffer[ValStart], "FALSE", 5) == 0) {
+                    Config->KaslrEnabled = FALSE;
+                }
+            }
         }
 
         // Skip newline chars
@@ -215,7 +232,10 @@ VOID LoadConfig(
         Start = End;
     }
     FreePool(Buffer);
-    Print(L"Config Loaded: Kernel=%s\n", Config->KernelPath);
+    Print(L"Config Loaded: Kernel=%s, KASLR=%s\n", Config->KernelPath, Config->KaslrEnabled ? L"ON" : L"OFF");
+    if (Config->CmdLine[0] != '\0') {
+        Print(L"CmdLine: %a\n", Config->CmdLine);
+    }
 }
 
 
@@ -225,7 +245,7 @@ VOID LoadConfig(
 
 EFI_STATUS LoadElfKernel(
     IN EFI_FILE_HANDLE RootDir,
-    IN CHAR16 *FileName,
+    IN PXS_CONFIG *Config,
     OUT EFI_PHYSICAL_ADDRESS *EntryPoint,
     OUT UINT64 *KernelBase,
     OUT UINT64 *KernelSize
@@ -237,11 +257,11 @@ EFI_STATUS LoadElfKernel(
     Elf64_Phdr *Phdr;
     UINTN i;
     EFI_RNG_PROTOCOL *Rng;
-    Print(L"Loading Kernel: %s\n", FileName);
+    Print(L"Loading Kernel: %s\n", Config->KernelPath);
 
-    Status = LoadFile(RootDir, FileName, &FileBuffer, &FileSize);
+    Status = LoadFile(RootDir, Config->KernelPath, &FileBuffer, &FileSize);
     if (EFI_ERROR(Status)) {
-        Print(L"Error: Could not open kernel file '%s'. %r\n", FileName, Status);
+        Print(L"Error: Could not open kernel file '%s'. %r\n", Config->KernelPath, Status);
         return Status;
     }
 
@@ -289,44 +309,50 @@ EFI_STATUS LoadElfKernel(
     BOOLEAN KaslrSuccess = FALSE;
     UINT64 RandomSeed = 0;
 
-    Status = gBS->LocateProtocol(&gEfiRngProtocolGuid, NULL, (VOID **)&Rng);
-    if (!EFI_ERROR(Status)) {
-        // Print(L"RNG Protocol Found.\n");
-        EFI_RNG_ALGORITHM RngAlgo;
-        UINTN AlgoSize = sizeof(RngAlgo);
-        Status = Rng->GetInfo(Rng, &AlgoSize, &RngAlgo);
+    if (Config->KaslrEnabled) {
+        Status = gBS->LocateProtocol(&gEfiRngProtocolGuid, NULL, (VOID **)&Rng);
         if (!EFI_ERROR(Status)) {
-             Status = Rng->GetRNG(Rng, NULL, sizeof(RandomSeed), (UINT8*)&RandomSeed);
-             if (EFI_ERROR(Status)) RandomSeed = 0;
-        }
-    } else {
-        // Print(L"RNG Protocol Not Found. Fallback to TSC...\n");
-        // Simple TSC fallback mixed with other vars
-        RandomSeed = __builtin_ia32_rdtsc();
-    }
-
-    if (RandomSeed != 0) {
-        // Try 64 times to find a slot
-        for (int attempt = 0; attempt < 64; attempt++) {
-            // Simple LCG for next attempt if needed
-            RandomSeed = RandomSeed * 6364136223846793005ULL + 1;
-            // Constrain to 2MB - 1GB range
-            UINT64 Candidate = 0x200000 + (RandomSeed % (0x40000000 - TotalSize));
-            Candidate &= ~(0x1FFFFF); // Align to 2MB
-
-            Status = gBS->AllocatePages(AllocateAddress, EfiLoaderData, TotalPages, &Candidate);
+            // Print(L"RNG Protocol Found.\n");
+            EFI_RNG_ALGORITHM RngAlgo;
+            UINTN AlgoSize = sizeof(RngAlgo);
+            Status = Rng->GetInfo(Rng, &AlgoSize, &RngAlgo);
             if (!EFI_ERROR(Status)) {
-                LoadBase = Candidate;
-                Slide = LoadBase - BaseOffset;
-                KaslrSuccess = TRUE;
-                Print(L"KASLR: Loaded at 0x%lx (Slide: 0x%lx)\n", LoadBase, Slide);
-                break;
+                Status = Rng->GetRNG(Rng, NULL, sizeof(RandomSeed), (UINT8*)&RandomSeed);
+                if (EFI_ERROR(Status)) RandomSeed = 0;
+            }
+        } else {
+            // Print(L"RNG Protocol Not Found. Fallback to TSC...\n");
+            // Simple TSC fallback mixed with other vars
+            RandomSeed = __builtin_ia32_rdtsc();
+        }
+
+        if (RandomSeed != 0) {
+            // Try 64 times to find a slot
+            for (int attempt = 0; attempt < 64; attempt++) {
+                // Simple LCG for next attempt if needed
+                RandomSeed = RandomSeed * 6364136223846793005ULL + 1;
+                // Constrain to 2MB - 1GB range
+                UINT64 Candidate = 0x200000 + (RandomSeed % (0x40000000 - TotalSize));
+                Candidate &= ~(0x1FFFFF); // Align to 2MB
+
+                Status = gBS->AllocatePages(AllocateAddress, EfiLoaderData, TotalPages, &Candidate);
+                if (!EFI_ERROR(Status)) {
+                    LoadBase = Candidate;
+                    Slide = LoadBase - BaseOffset;
+                    KaslrSuccess = TRUE;
+                    Print(L"KASLR: Loaded at 0x%lx (Slide: 0x%lx)\n", LoadBase, Slide);
+                    break;
+                }
             }
         }
+    } else {
+        Print(L"KASLR: Disabled by config.\n");
     }
 
     if (!KaslrSuccess) {
-        Print(L"KASLR failed. Fallback to fixed address.\n");
+        if (Config->KaslrEnabled) {
+            Print(L"KASLR failed. Fallback to fixed address.\n");
+        }
         LoadBase = BaseOffset;
         Status = gBS->AllocatePages(AllocateAddress, EfiLoaderData, TotalPages, &LoadBase);
         if (EFI_ERROR(Status)) {
@@ -435,7 +461,7 @@ EFI_STATUS EFIAPI UefiMain(
     }
 
     // 5. Load Kernel
-    Status = LoadElfKernel(RootDir, Config.KernelPath, &KernelEntry, &BootInfo->KernelPhysicalBase, &BootInfo->KernelFileSize);
+    Status = LoadElfKernel(RootDir, &Config, &KernelEntry, &BootInfo->KernelPhysicalBase, &BootInfo->KernelFileSize);
     if (EFI_ERROR(Status)) {
         FatalError(L"Failed to load kernel", Status);
     }
@@ -471,6 +497,15 @@ EFI_STATUS EFIAPI UefiMain(
     }
     BootInfo->Smbios = GetSystemConfigurationTable(&gEfiSmbiosTableGuid);
     BootInfo->RuntimeServicesPtr = (UINT64)gST->RuntimeServices;
+
+    if (BootInfo->Rsdp) {
+        Print(L"RSDP found at 0x%lx\n", (UINT64)BootInfo->Rsdp);
+    } else {
+        Print(L"Warning: RSDP not found\n");
+    }
+    if (BootInfo->Smbios) {
+        Print(L"SMBIOS found at 0x%lx\n", (UINT64)BootInfo->Smbios);
+    }
 
     Print(L"Kernel loaded at 0x%lx (Entry: 0x%lx)\n", BootInfo->KernelPhysicalBase, KernelEntry);
     Print(L"Preparing for exit...\n");
