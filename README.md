@@ -1,43 +1,48 @@
-# PXS Bootloader
+# PxsPkg - UEFI Bootloader for VoidFrameX
 
-PXS (Pre-eXecutionSystem) is a UEFI bootloader designed to load 64-bit ELF kernels.
+PxsPkg is a custom UEFI bootloader designed to load ELF64 kernels with support for KASLR, Initrd, and a custom boot protocol.
 
 ## Features
-- Loads 64-bit ELF executables (`kernel.elf`) from the boot partition.
-- maps kernel segments to their physical addresses specified in the ELF Program Headers (`p_paddr`).
-- Sets up a high-resolution Framebuffer (GOP).
-- Gathers System Information (ACPI, SMBIOS, Memory Map).
-- Exits UEFI Boot Services and jumps to the kernel entry point.
 
-## Kernel Interface
+- **ELF64 Loading:** Parses and loads ELF64 executables.
+- **KASLR:** Kernel Address Space Layout Randomization support.
+- **Configuration:** `pxs.cfg` file support for flexible boot options.
+- **Initrd:** Support for loading an initial ramdisk.
+- **Protocol:** Passes a comprehensive `PXS_BOOT_INFO` structure to the kernel.
 
-The kernel entry point should match the following signature:
+## Configuration (pxs.cfg)
+
+The bootloader looks for a file named `pxs.cfg` in the root directory of the boot partition.
+
+**Format:**
+```ini
+KERNEL=filename.krnl
+INITRD=ramdisk.img
+CMDLINE=arg1 arg2 key=value
+TIMEOUT=5
+```
+
+**Options:**
+- `KERNEL`: Path to the kernel ELF file (Default: `voidframex.krnl`).
+- `INITRD`: Path to the Initrd/Ramdisk file (Optional).
+- `CMDLINE`: Command line string passed to the kernel (Max 511 chars).
+- `TIMEOUT`: Time in seconds to wait before booting (Default: 3).
+
+## Building
+
+1. Ensure you have the EDK2 environment set up.
+2. Run `./compile.sh` to build the bootloader.
+3. The output `Pxs.efi` will be in the `build/` directory.
+
+## Boot Protocol
+
+The kernel entry point receives a pointer to the `PXS_BOOT_INFO` structure:
 
 ```c
 typedef struct {
-    // ... (See include/bootinfo.h)
+    uint32_t Magic;           // 0x21535850 ("PXS!")
+    uint32_t Version;         // Protocol Version
+    // ... Framebuffer, MemoryMap, ACPI, etc.
 } PXS_BOOT_INFO;
-
-void kernel_main(PXS_BOOT_INFO *BootInfo);
 ```
-
-### BootInfo Structure
-The `BootInfo` structure provides the kernel with essential system details:
-- **Framebuffer**: Base address, resolution, pitch, and color masks.
-- **Memory Map**: Complete UEFI memory map (required for physical memory management).
-- **System Tables**: Pointers to ACPI (RSDP) and SMBIOS entry points.
-
-## Build
-This package is designed to be built within the EDK2 environment.
-ensure `PxsPkg` is in your `PACKAGES_PATH`.
-
-```bash
-build -p PxsPkg/PxsPkg.dsc -a X64 -t GCC5
-```
-
-## Installation
-1. Build the loader (`Pxs.efi`).
-2. Rename `Pxs.efi` to `BOOTX64.EFI` and place it in `\EFI\BOOT\` on the ESP.
-3. Place your kernel executable at `\kernel.elf` on the root of the ESP.
-
-```
+See `protocol.h` for the full definition.

@@ -1,5 +1,6 @@
 #include <Uefi.h>
 #include <Library/UefiLib.h>
+#include <Library/BaseLib.h>
 #include <Library/UefiBootServicesTableLib.h>
 #include <Library/MemoryAllocationLib.h>
 #include <Library/BaseMemoryLib.h>
@@ -13,17 +14,43 @@
 
 #include <compiler.h>
 #include <elf.h>
-#include <protocol.h>
+#include <include/protocol.h>
 
-#define PXS_LOADER_VERSION "0.0.1"
-#define KERNEL_PATH        L"voidframex.krnl"
+#define PXS_LOADER_VERSION "0.1.0"
+#define DEFAULT_KERNEL_PATH L"voidframex.krnl"
+#define DEFAULT_CONFIG_PATH L"pxs.cfg"
 
 // Kernel Entry Point Type
 typedef VOID (*KERNEL_ENTRY)(PXS_BOOT_INFO *BootInfo);
 
+typedef struct {
+    CHAR16 KernelPath[256];
+    CHAR16 InitrdPath[256];
+    CHAR8  CmdLine[512];
+    UINTN  Timeout;
+} PXS_CONFIG;
+
 // --------------------------------------------------------------------------
 // HELPER FUNCTIONS
 // --------------------------------------------------------------------------
+
+VOID WaitForInput() {
+    EFI_INPUT_KEY Key;
+    UINTN EventIndex;
+    gST->ConIn->Reset(gST->ConIn, FALSE);
+    gBS->WaitForEvent(1, &gST->ConIn->WaitForKey, &EventIndex);
+    gST->ConIn->ReadKeyStroke(gST->ConIn, &Key);
+}
+
+VOID FatalError(IN CHAR16 *Message, IN EFI_STATUS Status) {
+    Print(L"\nCRITICAL ERROR: %s\n", Message);
+    if (EFI_ERROR(Status)) {
+        Print(L"Status Code: %r\n", Status);
+    }
+    Print(L"\nPress any key to reboot...\n");
+    WaitForInput();
+    gST->RuntimeServices->ResetSystem(EfiResetCold, EFI_SUCCESS, 0, NULL);
+}
 
 EFI_STATUS GetFileSize(IN EFI_FILE_HANDLE FileHandle, OUT UINT64 *FileSize) {
     EFI_STATUS Status;
@@ -57,6 +84,141 @@ VOID* GetSystemConfigurationTable(EFI_GUID *Guid) {
     return NULL;
 }
 
+EFI_STATUS LoadFile(
+    IN EFI_FILE_HANDLE RootDir,
+    IN CHAR16 *FileName,
+    OUT VOID **Buffer,
+    OUT UINT64 *Size
+) {
+    EFI_STATUS Status;
+    EFI_FILE_HANDLE FileHandle;
+    UINT64 FileSize;
+    VOID *FileBuffer;
+
+    Status = RootDir->Open(RootDir, &FileHandle, FileName, EFI_FILE_MODE_READ, 0);
+    if (EFI_ERROR(Status)) return Status;
+
+    Status = GetFileSize(FileHandle, &FileSize);
+    if (EFI_ERROR(Status)) {
+        FileHandle->Close(FileHandle);
+        return Status;
+    }
+
+    FileBuffer = AllocatePool(FileSize);
+    if (!FileBuffer) {
+        FileHandle->Close(FileHandle);
+        return EFI_OUT_OF_RESOURCES;
+    }
+
+    UINTN ReadSize = FileSize;
+    Status = FileHandle->Read(FileHandle, &ReadSize, FileBuffer);
+    FileHandle->Close(FileHandle);
+
+    if (EFI_ERROR(Status)) {
+        FreePool(FileBuffer);
+        return Status;
+    }
+
+    *Buffer = FileBuffer;
+    *Size = FileSize;
+    return EFI_SUCCESS;
+}
+
+// Simple config parser
+// Format: KEY=VALUE
+// KERNEL=path
+// INITRD=path
+// CMDLINE=string
+VOID LoadConfig(
+    IN EFI_FILE_HANDLE RootDir,
+    IN CHAR16 *ConfigName,
+    OUT PXS_CONFIG *Config
+) {
+    EFI_STATUS Status;
+    VOID *Buffer;
+    UINT64 Size;
+    CHAR8 *AsciiBuffer;
+
+    // Set defaults
+    StrCpyS(Config->KernelPath, 256, DEFAULT_KERNEL_PATH);
+    Config->InitrdPath[0] = L'\0';
+    Config->CmdLine[0] = '\0';
+    Config->Timeout = 3;
+
+    Status = LoadFile(RootDir, ConfigName, &Buffer, &Size);
+    if (EFI_ERROR(Status)) {
+        Print(L"Config '%s' not found. Using defaults.\n", ConfigName);
+        return;
+    }
+
+    AsciiBuffer = (CHAR8*)Buffer;
+    UINTN Start = 0;
+    UINTN End = 0;
+
+    while (End < Size) {
+        // Find end of line
+        while (End < Size && AsciiBuffer[End] != '\n' && AsciiBuffer[End] != '\r') {
+            End++;
+        }
+
+        // Process line [Start, End)
+        if (End > Start) {
+            // Check for KERNEL=
+            if (AsciiStrnCmp(&AsciiBuffer[Start], "KERNEL=", 7) == 0) {
+                UINTN ValStart = Start + 7;
+                UINTN ValLen = End - ValStart;
+                // Convert to CHAR16
+                for (UINTN i=0; i < ValLen && i < 255; i++) {
+                    Config->KernelPath[i] = (CHAR16)AsciiBuffer[ValStart + i];
+                }
+                Config->KernelPath[ValLen < 255 ? ValLen : 255] = L'\0';
+            }
+            // Check for INITRD=
+            else if (AsciiStrnCmp(&AsciiBuffer[Start], "INITRD=", 7) == 0) {
+                UINTN ValStart = Start + 7;
+                UINTN ValLen = End - ValStart;
+                for (UINTN i=0; i < ValLen && i < 255; i++) {
+                    Config->InitrdPath[i] = (CHAR16)AsciiBuffer[ValStart + i];
+                }
+                Config->InitrdPath[ValLen < 255 ? ValLen : 255] = L'\0';
+            }
+            // Check for CMDLINE=
+            else if (AsciiStrnCmp(&AsciiBuffer[Start], "CMDLINE=", 8) == 0) {
+                UINTN ValStart = Start + 8;
+                UINTN ValLen = End - ValStart;
+                for (UINTN i=0; i < ValLen && i < 511; i++) {
+                    Config->CmdLine[i] = AsciiBuffer[ValStart + i];
+                }
+                Config->CmdLine[ValLen < 511 ? ValLen : 511] = '\0';
+            }
+            // Check for TIMEOUT=
+            else if (AsciiStrnCmp(&AsciiBuffer[Start], "TIMEOUT=", 8) == 0) {
+                UINTN ValStart = Start + 8;
+                UINTN ValLen = End - ValStart;
+                UINTN TimeoutVal = 0;
+                for (UINTN i = 0; i < ValLen; i++) {
+                    CHAR8 c = AsciiBuffer[ValStart + i];
+                    if (c >= '0' && c <= '9') {
+                        TimeoutVal = TimeoutVal * 10 + (c - '0');
+                    } else {
+                        break; // Stop at non-digit
+                    }
+                }
+                Config->Timeout = TimeoutVal;
+            }
+        }
+
+        // Skip newline chars
+        while (End < Size && (AsciiBuffer[End] == '\n' || AsciiBuffer[End] == '\r')) {
+            End++;
+        }
+        Start = End;
+    }
+    FreePool(Buffer);
+    Print(L"Config Loaded: Kernel=%s\n", Config->KernelPath);
+}
+
+
 // --------------------------------------------------------------------------
 // ELF LOADER
 // --------------------------------------------------------------------------
@@ -65,10 +227,10 @@ EFI_STATUS LoadElfKernel(
     IN EFI_FILE_HANDLE RootDir,
     IN CHAR16 *FileName,
     OUT EFI_PHYSICAL_ADDRESS *EntryPoint,
-    OUT UINT64 *KernelBase
+    OUT UINT64 *KernelBase,
+    OUT UINT64 *KernelSize
 ) {
     EFI_STATUS Status;
-    EFI_FILE_HANDLE FileHandle;
     UINT64 FileSize;
     VOID *FileBuffer;
     Elf64_Ehdr *Ehdr;
@@ -77,35 +239,13 @@ EFI_STATUS LoadElfKernel(
     EFI_RNG_PROTOCOL *Rng;
     Print(L"Loading Kernel: %s\n", FileName);
 
-    // Open file
-    Status = RootDir->Open(RootDir, &FileHandle, FileName, EFI_FILE_MODE_READ, 0);
+    Status = LoadFile(RootDir, FileName, &FileBuffer, &FileSize);
     if (EFI_ERROR(Status)) {
-        Print(L"Error: Could not open kernel file. %r\n", Status);
+        Print(L"Error: Could not open kernel file '%s'. %r\n", FileName, Status);
         return Status;
     }
 
-    // Get size
-    Status = GetFileSize(FileHandle, &FileSize);
-    if (EFI_ERROR(Status)) {
-        FileHandle->Close(FileHandle);
-        return Status;
-    }
-
-    // Allocate buffer for the whole file
-    FileBuffer = AllocatePool(FileSize);
-    if (!FileBuffer) {
-        FileHandle->Close(FileHandle);
-        return EFI_OUT_OF_RESOURCES;
-    }
-
-    // Read file
-    UINTN ReadSize = FileSize;
-    Status = FileHandle->Read(FileHandle, &ReadSize, FileBuffer);
-    FileHandle->Close(FileHandle);
-    if (EFI_ERROR(Status)) {
-        FreePool(FileBuffer);
-        return Status;
-    }
+    *KernelSize = FileSize;
 
     // Check ELF Header
     Ehdr = (Elf64_Ehdr *)FileBuffer;
@@ -151,7 +291,7 @@ EFI_STATUS LoadElfKernel(
 
     Status = gBS->LocateProtocol(&gEfiRngProtocolGuid, NULL, (VOID **)&Rng);
     if (!EFI_ERROR(Status)) {
-        Print(L"RNG Protocol Found. Generating Random Seed...\n");
+        // Print(L"RNG Protocol Found.\n");
         EFI_RNG_ALGORITHM RngAlgo;
         UINTN AlgoSize = sizeof(RngAlgo);
         Status = Rng->GetInfo(Rng, &AlgoSize, &RngAlgo);
@@ -160,14 +300,14 @@ EFI_STATUS LoadElfKernel(
              if (EFI_ERROR(Status)) RandomSeed = 0;
         }
     } else {
-        Print(L"RNG Protocol Not Found. Fallback to TSC...\n");
+        // Print(L"RNG Protocol Not Found. Fallback to TSC...\n");
         // Simple TSC fallback mixed with other vars
         RandomSeed = __builtin_ia32_rdtsc();
     }
 
     if (RandomSeed != 0) {
-        // Try 32 times to find a slot
-        for (int attempt = 0; attempt < 32; attempt++) {
+        // Try 64 times to find a slot
+        for (int attempt = 0; attempt < 64; attempt++) {
             // Simple LCG for next attempt if needed
             RandomSeed = RandomSeed * 6364136223846793005ULL + 1;
             // Constrain to 2MB - 1GB range
@@ -190,7 +330,6 @@ EFI_STATUS LoadElfKernel(
         LoadBase = BaseOffset;
         Status = gBS->AllocatePages(AllocateAddress, EfiLoaderData, TotalPages, &LoadBase);
         if (EFI_ERROR(Status)) {
-             Print(L"Error: Failed to allocate kernel memory at 0x%lx\n", LoadBase);
              FreePool(FileBuffer);
              return Status;
         }
@@ -203,7 +342,7 @@ EFI_STATUS LoadElfKernel(
         if (Phdr[i].p_type == PT_LOAD) {
             UINT64 PhysAddr = Phdr[i].p_paddr + Slide;
             UINT64 OffsetInAlloc = PhysAddr - LoadBase;
-            Print(L"Segment %d: Load @ 0x%lx\n", i, PhysAddr);
+            // Print(L"Segment %d: Load @ 0x%lx\n", i, PhysAddr);
             CopyMem((VOID *)(LoadBase + OffsetInAlloc), (UINT8 *)FileBuffer + Phdr[i].p_offset, Phdr[i].p_filesz);
         }
     }
@@ -229,79 +368,101 @@ EFI_STATUS EFIAPI UefiMain(
     EFI_GRAPHICS_OUTPUT_PROTOCOL *Gop;
     EFI_PHYSICAL_ADDRESS KernelEntry;
     PXS_BOOT_INFO *BootInfo;
+    PXS_CONFIG Config;
     UINTN MemoryMapSize = 0;
     EFI_MEMORY_DESCRIPTOR *MemoryMap = NULL;
     UINTN MapKey;
     UINTN DescriptorSize;
     UINT32 DescriptorVersion;
+    VOID *InitrdBuffer = NULL;
+    UINT64 InitrdSize = 0;
 
     gST->ConOut->ClearScreen(gST->ConOut);
-    Print(L"PXS Bootloader v%a\n", PXS_LOADER_VERSION);
+    Print(L"[-- PXS v%a --]\n", PXS_LOADER_VERSION);
 
     // 1. Initialize File System
     Status = gBS->HandleProtocol(ImageHandle, &gEfiLoadedImageProtocolGuid, (VOID **)&LoadedImage);
     if (EFI_ERROR(Status)) {
-        Print(L"Error: LoadedImageProtocol not found\n");
-        return Status;
+        FatalError(L"LoadedImageProtocol not found", Status);
     }
 
     Status = gBS->HandleProtocol(LoadedImage->DeviceHandle, &gEfiSimpleFileSystemProtocolGuid, (VOID **)&FileSystem);
     if (EFI_ERROR(Status)) {
-        Print(L"Error: SimpleFileSystemProtocol not found\n");
-        return Status;
+        FatalError(L"SimpleFileSystemProtocol not found", Status);
     }
 
     Status = FileSystem->OpenVolume(FileSystem, &RootDir);
     if (EFI_ERROR(Status)) {
-        Print(L"Error: Could not open volume\n");
-        return Status;
+        FatalError(L"Could not open volume", Status);
     }
 
-    // 2. Prepare BootInfo
+    // 2. Load Configuration
+    LoadConfig(RootDir, DEFAULT_CONFIG_PATH, &Config);
+
+    // 3. Prepare BootInfo
     Status = gBS->AllocatePool(EfiLoaderData, sizeof(PXS_BOOT_INFO), (VOID **)&BootInfo);
-    if (EFI_ERROR(Status)) return EFI_OUT_OF_RESOURCES;
+    if (EFI_ERROR(Status)) FatalError(L"Failed to allocate BootInfo", Status);
     SetMem(BootInfo, sizeof(PXS_BOOT_INFO), 0);
 
-    // 3. Load Kernel
-    Status = LoadElfKernel(RootDir, KERNEL_PATH, &KernelEntry, &BootInfo->KernelPhysicalBase);
+    BootInfo->Magic = PXS_MAGIC;
+    BootInfo->Version = 1; // Protocol Version 1
+    BootInfo->Flags = 0;
+
+    // Copy Command Line
+    UINTN CmdLineLen = AsciiStrLen(Config.CmdLine);
+    if (CmdLineLen > 0) {
+        VOID *CmdLineBuffer;
+        Status = gBS->AllocatePool(EfiLoaderData, CmdLineLen + 1, &CmdLineBuffer);
+        if (!EFI_ERROR(Status)) {
+            CopyMem(CmdLineBuffer, Config.CmdLine, CmdLineLen + 1);
+            BootInfo->CommandLine = (CHAR8*)CmdLineBuffer;
+        }
+    } else {
+        BootInfo->CommandLine = NULL;
+    }
+
+    // 4. Load Initrd (if specified)
+    if (StrLen(Config.InitrdPath) > 0) {
+        Print(L"Loading Initrd: %s\n", Config.InitrdPath);
+        Status = LoadFile(RootDir, Config.InitrdPath, &InitrdBuffer, &InitrdSize);
+        if (EFI_ERROR(Status)) {
+            Print(L"Warning: Failed to load Initrd '%s'. Continuing...\n", Config.InitrdPath);
+        } else {
+            BootInfo->InitrdAddress = (UINT64)InitrdBuffer;
+            BootInfo->InitrdSize = InitrdSize;
+            Print(L"Initrd Loaded @ 0x%lx (Size: %ld bytes)\n", BootInfo->InitrdAddress, BootInfo->InitrdSize);
+        }
+    }
+
+    // 5. Load Kernel
+    Status = LoadElfKernel(RootDir, Config.KernelPath, &KernelEntry, &BootInfo->KernelPhysicalBase, &BootInfo->KernelFileSize);
     if (EFI_ERROR(Status)) {
-        Print(L"Failed to load kernel.\n");
-        while(1);
+        FatalError(L"Failed to load kernel", Status);
     }
     RootDir->Close(RootDir);
 
-    // 4. Setup Graphics
+    // 6. Setup Graphics
     Status = gBS->LocateProtocol(&gEfiGraphicsOutputProtocolGuid, NULL, (VOID **)&Gop);
     if (EFI_ERROR(Status)) {
-        Print(L"Error: GOP not found\n");
-        return Status;
-    }
+        Print(L"Warning: GOP not found. Headless mode.\n");
+    } else {
+        BootInfo->Framebuffer.BaseAddress = Gop->Mode->FrameBufferBase;
+        BootInfo->Framebuffer.Size = Gop->Mode->FrameBufferSize;
+        BootInfo->Framebuffer.Width = Gop->Mode->Info->HorizontalResolution;
+        BootInfo->Framebuffer.Height = Gop->Mode->Info->VerticalResolution;
+        BootInfo->Framebuffer.PixelsPerScanLine = Gop->Mode->Info->PixelsPerScanLine;
 
-    BootInfo->Framebuffer.BaseAddress = Gop->Mode->FrameBufferBase;
-    BootInfo->Framebuffer.Size = Gop->Mode->FrameBufferSize;
-    BootInfo->Framebuffer.Width = Gop->Mode->Info->HorizontalResolution;
-    BootInfo->Framebuffer.Height = Gop->Mode->Info->VerticalResolution;
-    BootInfo->Framebuffer.PixelsPerScanLine = Gop->Mode->Info->PixelsPerScanLine;
-
-    // RGB Format handling
-    if (Gop->Mode->Info->PixelFormat == PixelRedGreenBlueReserved8BitPerColor) {
-        BootInfo->Framebuffer.RedFieldPosition = 0;
-        BootInfo->Framebuffer.RedMaskSize = 8;
-        BootInfo->Framebuffer.GreenFieldPosition = 8;
-        BootInfo->Framebuffer.GreenMaskSize = 8;
-        BootInfo->Framebuffer.BlueFieldPosition = 16;
-        BootInfo->Framebuffer.BlueMaskSize = 8;
-        BootInfo->Framebuffer.ReservedFieldPosition = 24;
-        BootInfo->Framebuffer.ReservedMaskSize = 8;
-    } else if (Gop->Mode->Info->PixelFormat == PixelBlueGreenRedReserved8BitPerColor) {
-        BootInfo->Framebuffer.RedFieldPosition = 16;
-        BootInfo->Framebuffer.RedMaskSize = 8;
-        BootInfo->Framebuffer.GreenFieldPosition = 8;
-        BootInfo->Framebuffer.GreenMaskSize = 8;
-        BootInfo->Framebuffer.BlueFieldPosition = 0;
-        BootInfo->Framebuffer.BlueMaskSize = 8;
-        BootInfo->Framebuffer.ReservedFieldPosition = 24;
-        BootInfo->Framebuffer.ReservedMaskSize = 8;
+        if (Gop->Mode->Info->PixelFormat == PixelRedGreenBlueReserved8BitPerColor) {
+            BootInfo->Framebuffer.RedFieldPosition = 0; BootInfo->Framebuffer.RedMaskSize = 8;
+            BootInfo->Framebuffer.GreenFieldPosition = 8; BootInfo->Framebuffer.GreenMaskSize = 8;
+            BootInfo->Framebuffer.BlueFieldPosition = 16; BootInfo->Framebuffer.BlueMaskSize = 8;
+            BootInfo->Framebuffer.ReservedFieldPosition = 24; BootInfo->Framebuffer.ReservedMaskSize = 8;
+        } else if (Gop->Mode->Info->PixelFormat == PixelBlueGreenRedReserved8BitPerColor) {
+            BootInfo->Framebuffer.RedFieldPosition = 16; BootInfo->Framebuffer.RedMaskSize = 8;
+            BootInfo->Framebuffer.GreenFieldPosition = 8; BootInfo->Framebuffer.GreenMaskSize = 8;
+            BootInfo->Framebuffer.BlueFieldPosition = 0; BootInfo->Framebuffer.BlueMaskSize = 8;
+            BootInfo->Framebuffer.ReservedFieldPosition = 24; BootInfo->Framebuffer.ReservedMaskSize = 8;
+        }
     }
 
     BootInfo->Rsdp = GetSystemConfigurationTable(&gEfiAcpi20TableGuid);
@@ -311,27 +472,31 @@ EFI_STATUS EFIAPI UefiMain(
     BootInfo->Smbios = GetSystemConfigurationTable(&gEfiSmbiosTableGuid);
     BootInfo->RuntimeServicesPtr = (UINT64)gST->RuntimeServices;
 
-    Print(L"Kernel loaded at 0x%lx\n", KernelEntry);
-    Print(L"Framebuffer: %dx%d @ 0x%lx\n", BootInfo->Framebuffer.Width, BootInfo->Framebuffer.Height, BootInfo->Framebuffer.BaseAddress);
-    Print(L"Exiting Boot Services...\n");
+    Print(L"Kernel loaded at 0x%lx (Entry: 0x%lx)\n", BootInfo->KernelPhysicalBase, KernelEntry);
+    Print(L"Preparing for exit...\n");
 
-    // 5. Get Memory Map
+    if (Config.Timeout > 0) {
+        gBS->Stall(Config.Timeout * 1000000);
+    }
+
+    Print(L"[-- PXS INITIALIZATION COMPLETE --] -- exiting boot services...\n");
+
+    // 7. Get Memory Map
     MemoryMapSize = 4096;
     Status = gBS->AllocatePool(EfiLoaderData, MemoryMapSize, (VOID **)&MemoryMap);
-    if (EFI_ERROR(Status)) return EFI_OUT_OF_RESOURCES;
+    if (EFI_ERROR(Status)) FatalError(L"Alloc MemoryMap failed", Status);
 
     Status = gBS->GetMemoryMap(&MemoryMapSize, MemoryMap, &MapKey, &DescriptorSize, &DescriptorVersion);
     while (Status == EFI_BUFFER_TOO_SMALL) {
         gBS->FreePool(MemoryMap);
         MemoryMapSize += 4096;
         Status = gBS->AllocatePool(EfiLoaderData, MemoryMapSize, (VOID **)&MemoryMap);
-        if (EFI_ERROR(Status)) return EFI_OUT_OF_RESOURCES;
+        if (EFI_ERROR(Status)) FatalError(L"Alloc MemoryMap retry failed", Status);
         Status = gBS->GetMemoryMap(&MemoryMapSize, MemoryMap, &MapKey, &DescriptorSize, &DescriptorVersion);
     }
 
     if (EFI_ERROR(Status)) {
-        Print(L"Error: Could not get memory map\n");
-        while(1);
+        FatalError(L"GetMemoryMap failed", Status);
     }
 
     BootInfo->MemoryMap = MemoryMap;
@@ -342,14 +507,22 @@ EFI_STATUS EFIAPI UefiMain(
 
     Status = gBS->ExitBootServices(ImageHandle, MapKey);
     if (EFI_ERROR(Status)) {
-        Print(L"Error: Could not exit boot services. %r\n", Status);
-        while(1);
+        Print(L"ExitBootServices failed. Retrying...\n");
+        // Retry mechanism as per UEFI spec
+        Status = gBS->GetMemoryMap(&MemoryMapSize, MemoryMap, &MapKey, &DescriptorSize, &DescriptorVersion);
+        if (EFI_ERROR(Status)) FatalError(L"GetMemoryMap(2) failed", Status);
+        BootInfo->MapKey = MapKey; // Update key
+        Status = gBS->ExitBootServices(ImageHandle, MapKey);
+        if (EFI_ERROR(Status)) {
+            FatalError(L"ExitBootServices(2) failed", Status);
+        }
     }
 
-    // 6. Jump to Kernel
+    // 8. Jump to Kernel
     KERNEL_ENTRY Entry = (KERNEL_ENTRY)KernelEntry;
     Entry(BootInfo);
 
+    // Should not reach here
     while(1);
     return EFI_SUCCESS;
 }

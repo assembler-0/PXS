@@ -10,6 +10,7 @@
 #include <stdint.h>
 
 #define PXS_PROTOCOL_VERSION "0.0.1"
+#define PXS_MAGIC 0x21535850
 
 typedef uint64_t EFI_PHYSICAL_ADDRESS;
 typedef uint64_t EFI_VIRTUAL_ADDRESS;
@@ -39,6 +40,11 @@ typedef struct {
 } PXS_FRAMEBUFFER_INFO;
 
 typedef struct {
+    // Header
+    uint32_t                Magic;           ///< "PXS!" (0x21535850)
+    uint32_t                Version;         ///< Protocol Version
+    uint32_t                Flags;           ///< Boot Flags
+
     // Framebuffer
     PXS_FRAMEBUFFER_INFO    Framebuffer;
     // Memory Map
@@ -53,4 +59,12 @@ typedef struct {
     uint64_t                RuntimeServicesPtr;
     // Kernel Info
     uint64_t                KernelPhysicalBase;
+    uint64_t                KernelFileSize;
+
+    // Modules (Initrd/Ramdisk)
+    uint64_t                InitrdAddress;
+    uint64_t                InitrdSize;
+
+    // Command Line
+    char                    *CommandLine;
 } PXS_BOOT_INFO;

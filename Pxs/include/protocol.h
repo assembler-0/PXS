@@ -5,13 +5,7 @@
 
 #include <Uefi.h>
 
-// typedef struct {
-//   UINT32                Type;
-//   EFI_PHYSICAL_ADDRESS    PhysicalStart;
-//   EFI_VIRTUAL_ADDRESS     VirtualStart;
-//   UINT64                NumberOfPages;
-//   UINT64                Attribute;
-// } EFI_MEMORY_DESCRIPTOR;
+#define PXS_MAGIC 0x21535850
 
 typedef struct {
     UINT64 BaseAddress;
@@ -30,21 +24,34 @@ typedef struct {
 } PXS_FRAMEBUFFER_INFO;
 
 typedef struct {
+    // Header
+    UINT32                Magic;           ///< "PXS!" (0x21535850)
+    UINT32                Version;         ///< Protocol Version
+    UINT32                Flags;           ///< Boot Flags
+
     // Framebuffer
     PXS_FRAMEBUFFER_INFO    Framebuffer;
 
     // Memory Map
     EFI_MEMORY_DESCRIPTOR   *MemoryMap;
-    UINTN            MemoryMapSize;
-    UINTN            MapKey;
-    UINTN            DescriptorSize;
-    UINT32                DescriptorVersion;
+    UINTN                   MemoryMapSize;
+    UINTN                   MapKey;
+    UINTN                   DescriptorSize;
+    UINT32                  DescriptorVersion;
 
     // System Tables
     VOID                    *Rsdp;
     VOID                    *Smbios;
-    UINT64                RuntimeServicesPtr;
+    UINT64                  RuntimeServicesPtr;
 
     // Kernel Info
-    UINT64                KernelPhysicalBase;
+    UINT64                  KernelPhysicalBase;
+    UINT64                  KernelFileSize;
+
+    // Modules (Initrd/Ramdisk)
+    UINT64                  InitrdAddress;
+    UINT64                  InitrdSize;
+
+    // Command Line
+    CHAR8                   *CommandLine;
 } PXS_BOOT_INFO;
