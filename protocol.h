@@ -67,4 +67,7 @@ typedef struct {
 
     // Command Line
     char                    *CommandLine;
+
+    // Security Verification
+    uint64_t                SecurityCanary;
 } PXS_BOOT_INFO;

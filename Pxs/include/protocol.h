@@ -54,4 +54,7 @@ typedef struct {
 
     // Command Line
     CHAR8                   *CommandLine;
+
+    // Security Verification
+    UINT64                  SecurityCanary;
 } PXS_BOOT_INFO;

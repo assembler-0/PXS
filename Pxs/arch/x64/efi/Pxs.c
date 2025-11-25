@@ -125,6 +125,62 @@ EFI_STATUS LoadFile(
     return EFI_SUCCESS;
 }
 
+UINT64 GetBestEntropy() {
+    EFI_STATUS Status;
+    UINT64 Seed = 0;
+
+    // 1. Try UEFI RNG Protocol
+    EFI_RNG_PROTOCOL *Rng;
+    Status = gBS->LocateProtocol(&gEfiRngProtocolGuid, NULL, (VOID **)&Rng);
+    if (!EFI_ERROR(Status)) {
+        Status = Rng->GetRNG(Rng, NULL, sizeof(Seed), (UINT8*)&Seed);
+        if (!EFI_ERROR(Status) && Seed != 0) {
+            return Seed;
+        }
+    }
+
+    // 2. Try RDRAND (Hardware Instruction)
+    UINT32 Eax, Ecx, Edx;
+    // CPUID Leaf 1, ECX[30] = RDRAND
+    // Preserve RBX as it is callee-saved and used by PIC
+    __asm__ __volatile__ (
+        "pushq %%rbx\n\t"
+        "cpuid\n\t"
+        "popq %%rbx"
+        : "=a" (Eax), "=c" (Ecx), "=d" (Edx)
+        : "a" (1)
+        : "cc"
+    );
+
+    if (Ecx & (1 << 30)) {
+        UINT8 Success = 0;
+        // Retry loop for RDRAND underflow
+        for (int i = 0; i < 10; i++) {
+            __asm__ __volatile__ (
+                "rdrand %0; setc %1"
+                : "=r" (Seed), "=qm" (Success)
+            );
+            if (Success) return Seed;
+        }
+    }
+
+    // 3. Fallback: Mix Time and TSC
+    EFI_TIME Time;
+    gST->RuntimeServices->GetTime(&Time, NULL);
+
+    Seed = __builtin_ia32_rdtsc();
+    Seed ^= ((UINT64)Time.Nanosecond << 32);
+    Seed ^= ((UINT64)Time.Year << 16) | ((UINT64)Time.Month << 8) | Time.Day;
+    Seed ^= ((UINT64)Time.Hour << 24) | ((UINT64)Time.Minute << 16) | ((UINT64)Time.Second << 8);
+
+    // Simple mixing step (XOR-shift style)
+    Seed ^= (Seed << 13);
+    Seed ^= (Seed >> 7);
+    Seed ^= (Seed << 17);
+
+    return Seed;
+}
+
 // Simple config parser
 // Format: KEY=VALUE
 // KERNEL=path
@@ -231,6 +287,7 @@ VOID LoadConfig(
         }
         Start = End;
     }
+    SetMem(Buffer, Size, 0); // Secure wipe
     FreePool(Buffer);
     Print(L"Config Loaded: Kernel=%s, KASLR=%s\n", Config->KernelPath, Config->KaslrEnabled ? L"ON" : L"OFF");
     if (Config->CmdLine[0] != '\0') {
@@ -256,7 +313,6 @@ EFI_STATUS LoadElfKernel(
     Elf64_Ehdr *Ehdr;
     Elf64_Phdr *Phdr;
     UINTN i;
-    EFI_RNG_PROTOCOL *Rng;
     Print(L"Loading Kernel: %s\n", Config->KernelPath);
 
     Status = LoadFile(RootDir, Config->KernelPath, &FileBuffer, &FileSize);
@@ -303,6 +359,11 @@ EFI_STATUS LoadElfKernel(
     UINTN TotalPages = EFI_SIZE_TO_PAGES(TotalSize);
     Print(L"Image Size: 0x%lx bytes (%d Pages)\n", TotalSize, TotalPages);
 
+    if (MinPhys == 0) {
+        Print(L"WARNING: Kernel linked at 0x0. This is a Null Pointer Trap Hazard\n");
+        Print(L"         Consider linking higher (e.g., 1MB+) or using -Ttext.\n");
+    }
+
     // KASLR Logic
     EFI_PHYSICAL_ADDRESS LoadBase = 0;
     UINT64 Slide = 0;
@@ -310,21 +371,7 @@ EFI_STATUS LoadElfKernel(
     UINT64 RandomSeed = 0;
 
     if (Config->KaslrEnabled) {
-        Status = gBS->LocateProtocol(&gEfiRngProtocolGuid, NULL, (VOID **)&Rng);
-        if (!EFI_ERROR(Status)) {
-            // Print(L"RNG Protocol Found.\n");
-            EFI_RNG_ALGORITHM RngAlgo;
-            UINTN AlgoSize = sizeof(RngAlgo);
-            Status = Rng->GetInfo(Rng, &AlgoSize, &RngAlgo);
-            if (!EFI_ERROR(Status)) {
-                Status = Rng->GetRNG(Rng, NULL, sizeof(RandomSeed), (UINT8*)&RandomSeed);
-                if (EFI_ERROR(Status)) RandomSeed = 0;
-            }
-        } else {
-            // Print(L"RNG Protocol Not Found. Fallback to TSC...\n");
-            // Simple TSC fallback mixed with other vars
-            RandomSeed = __builtin_ia32_rdtsc();
-        }
+        RandomSeed = GetBestEntropy();
 
         if (RandomSeed != 0) {
             // Try 64 times to find a slot
@@ -374,6 +421,7 @@ EFI_STATUS LoadElfKernel(
     }
     *EntryPoint = Ehdr->e_entry + Slide;
     *KernelBase = LoadBase;
+    SetMem(FileBuffer, FileSize, 0); // Secure wipe
     FreePool(FileBuffer);
     return EFI_SUCCESS;
 }
@@ -497,6 +545,10 @@ EFI_STATUS EFIAPI UefiMain(
     }
     BootInfo->Smbios = GetSystemConfigurationTable(&gEfiSmbiosTableGuid);
     BootInfo->RuntimeServicesPtr = (UINT64)gST->RuntimeServices;
+
+    // Security Canary Generation
+    BootInfo->SecurityCanary = GetBestEntropy();
+    Print(L"Security Canary: 0x%lx\n", BootInfo->SecurityCanary);
 
     if (BootInfo->Rsdp) {
         Print(L"RSDP found at 0x%lx\n", (UINT64)BootInfo->Rsdp);
