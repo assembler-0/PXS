@@ -10,7 +10,7 @@
 #include <stdint.h>
 
 #define PXS_PROTOCOL_VERSION "0.0.1"
-#define PXS_MAGIC 0x21535850
+#define PXS_MAGIC 0x28082012
 
 typedef uint64_t EFI_PHYSICAL_ADDRESS;
 typedef uint64_t EFI_VIRTUAL_ADDRESS;

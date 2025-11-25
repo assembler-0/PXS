@@ -5,7 +5,7 @@
 
 #include <Uefi.h>
 
-#define PXS_MAGIC 0x21535850
+#define PXS_MAGIC 0x28082012
 
 typedef struct {
     UINT64 BaseAddress;
@@ -25,7 +25,7 @@ typedef struct {
 
 typedef struct {
     // Header
-    UINT32                Magic;           ///< "PXS!" (0x21535850)
+    UINT32                Magic;           ///< (0x28082012)
     UINT32                Version;         ///< Protocol Version
     UINT32                Flags;           ///< Boot Flags
 

@@ -40,7 +40,7 @@ The kernel entry point receives a pointer to the `PXS_BOOT_INFO` structure:
 
 ```c
 typedef struct {
-    uint32_t Magic;           // 0x21535850 ("PXS!")
+    uint32_t Magic;          
     uint32_t Version;         // Protocol Version
     // ... Framebuffer, MemoryMap, ACPI, etc.
 } PXS_BOOT_INFO;
