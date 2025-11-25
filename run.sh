@@ -1,6 +1,7 @@
 set -e
 mkdir root/EFI/BOOT -p
 cp build/DEBUG_GCC5/X64/Pxs.efi root/EFI/BOOT/bootx64.efi
+cp kernel/voidframex.krnl root/voidframex.krnl
 qemu-system-x86_64 \
   -bios /usr/share/edk2/x64/OVMF.4m.fd \
   -serial stdio \
