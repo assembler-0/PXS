@@ -160,7 +160,7 @@ UINT64 GetBestEntropy() {
                 "rdrand %0; setc %1"
                 : "=r" (Seed), "=qm" (Success)
             );
-            if (Success) return Seed;
+            if (Success && Seed != 0) return Seed;
         }
     }
 
@@ -252,7 +252,8 @@ VOID LoadConfig(
                 for (UINTN i=0; i < ValLen && i < 511; i++) {
                     Config->CmdLine[i] = AsciiBuffer[ValStart + i];
                 }
-                Config->CmdLine[ValLen < 511 ? ValLen : 511] = '\0';
+                UINTN MaxLen = (ValLen < 511) ? ValLen : 511;
+                Config->CmdLine[MaxLen] = '\0';
             }
             // Check for TIMEOUT=
             else if (AsciiStrnCmp(&AsciiBuffer[Start], "TIMEOUT=", 8) == 0) {
@@ -355,14 +356,9 @@ EFI_STATUS LoadElfKernel(
 
     // Align MinPhys down and MaxPhys up to Page Boundaries
     UINT64 BaseOffset = MinPhys & ~(0xFFF);
-    UINT64 TotalSize = (MaxPhys + 0xFFF) & (~(0xFFF) - BaseOffset);
+    UINT64 TotalSize = ((MaxPhys - MinPhys) + 0xFFF) & ~0xFFF;
     UINTN TotalPages = EFI_SIZE_TO_PAGES(TotalSize);
     Print(L"Image Size: 0x%lx bytes (%d Pages)\n", TotalSize, TotalPages);
-
-    if (MinPhys == 0) {
-        Print(L"WARNING: Kernel linked at 0x0. This is a Null Pointer Trap Hazard\n");
-        Print(L"         Consider linking higher (e.g., 1MB+) or using -Ttext.\n");
-    }
 
     // KASLR Logic
     EFI_PHYSICAL_ADDRESS LoadBase = 0;
@@ -379,16 +375,23 @@ EFI_STATUS LoadElfKernel(
                 // Simple LCG for next attempt if needed
                 RandomSeed = RandomSeed * 6364136223846793005ULL + 1;
                 // Constrain to 2MB - 1GB range
-                UINT64 Candidate = 0x200000 + (RandomSeed % (0x40000000 - TotalSize));
-                Candidate &= ~(0x1FFFFF); // Align to 2MB
+                if (TotalSize >= 0x40000000) {
+                    // Kernel too large for KASLR range
+                    Config->KaslrEnabled = FALSE;
+                    Print(L"KASLR: Kernel too large, disabled\n");
+                } else {
+                    UINT64 MaxOffset = 0x40000000 - TotalSize;
+                    UINT64 Candidate = 0x200000 + (RandomSeed % MaxOffset);
+                    Candidate &= ~(0x1FFFFF); // Align to 2MB
 
-                Status = gBS->AllocatePages(AllocateAddress, EfiLoaderData, TotalPages, &Candidate);
-                if (!EFI_ERROR(Status)) {
-                    LoadBase = Candidate;
-                    Slide = LoadBase - BaseOffset;
-                    KaslrSuccess = TRUE;
-                    Print(L"KASLR: Loaded at 0x%lx (Slide: 0x%lx)\n", LoadBase, Slide);
-                    break;
+                    Status = gBS->AllocatePages(AllocateAddress, EfiLoaderData, TotalPages, &Candidate);
+                    if (!EFI_ERROR(Status)) {
+                        LoadBase = Candidate;
+                        Slide = LoadBase - BaseOffset;
+                        KaslrSuccess = TRUE;
+                        Print(L"KASLR: Loaded at 0x%lx (Slide: 0x%lx)\n", LoadBase, Slide);
+                        break;
+                    }
                 }
             }
         }
@@ -415,7 +418,11 @@ EFI_STATUS LoadElfKernel(
         if (Phdr[i].p_type == PT_LOAD) {
             UINT64 PhysAddr = Phdr[i].p_paddr + Slide;
             UINT64 OffsetInAlloc = PhysAddr - LoadBase;
-            // Print(L"Segment %d: Load @ 0x%lx\n", i, PhysAddr);
+            if (OffsetInAlloc + Phdr[i].p_memsz > TotalSize) {
+                Print(L"Error: Segment %d exceeds allocated memory\n", i);
+                FreePool(FileBuffer);
+                return EFI_LOAD_ERROR;
+            }
             CopyMem((VOID *)(LoadBase + OffsetInAlloc), (UINT8 *)FileBuffer + Phdr[i].p_offset, Phdr[i].p_filesz);
         }
     }
@@ -479,7 +486,7 @@ EFI_STATUS EFIAPI UefiMain(
     SetMem(BootInfo, sizeof(PXS_BOOT_INFO), 0);
 
     BootInfo->Magic = PXS_MAGIC;
-    BootInfo->Version = 1; // Protocol Version 1
+    BootInfo->Version = PXS_PROTOCOL_VERSION; // Protocol Version 1
     BootInfo->Flags = 0;
 
     // Copy Command Line
@@ -548,7 +555,6 @@ EFI_STATUS EFIAPI UefiMain(
 
     // Security Canary Generation
     BootInfo->SecurityCanary = GetBestEntropy();
-    Print(L"Security Canary: 0x%lx\n", BootInfo->SecurityCanary);
 
     if (BootInfo->Rsdp) {
         Print(L"RSDP found at 0x%lx\n", (UINT64)BootInfo->Rsdp);

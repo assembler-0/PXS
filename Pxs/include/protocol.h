@@ -6,6 +6,7 @@
 #include <Uefi.h>
 
 #define PXS_MAGIC 0x28082012
+#define PXS_PROTOCOL_VERSION 1
 
 typedef struct {
     UINT64 BaseAddress;
@@ -25,18 +26,18 @@ typedef struct {
 
 typedef struct {
     // Header
-    UINT32                Magic;           ///< (0x28082012)
-    UINT32                Version;         ///< Protocol Version
-    UINT32                Flags;           ///< Boot Flags
+    UINT32                  Magic;           ///< (0x28082012)
+    UINT32                  Version;         ///< Protocol Version
+    UINT32                  Flags;           ///< Boot Flags
 
     // Framebuffer
     PXS_FRAMEBUFFER_INFO    Framebuffer;
 
     // Memory Map
-    EFI_MEMORY_DESCRIPTOR   *MemoryMap;
-    UINTN                   MemoryMapSize;
-    UINTN                   MapKey;
-    UINTN                   DescriptorSize;
+    EFI_MEMORY_DESCRIPTOR  *MemoryMap;
+    UINT64                  MemoryMapSize;
+    UINT64                  MapKey;
+    UINT64                  DescriptorSize;
     UINT32                  DescriptorVersion;
 
     // System Tables
