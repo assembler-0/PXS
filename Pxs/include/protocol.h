@@ -48,6 +48,7 @@ typedef struct {
     // Kernel Info
     UINT64                  KernelPhysicalBase;
     UINT64                  KernelFileSize;
+    UINT64                  KernelVirtualBase;
 
     // Modules (Initrd/Ramdisk)
     UINT64                  InitrdAddress;

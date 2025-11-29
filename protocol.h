@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include <cstdint>
 #include <stdint.h>
 
 #define PXS_MAGIC 0x28082012
@@ -79,6 +80,7 @@ typedef struct {
     // Kernel Info
     uint64_t                KernelPhysicalBase;
     uint64_t                KernelFileSize;
+    uint64_t                KernelVirtualBase;
 
     // Modules (Initrd/Ramdisk)
     uint64_t                InitrdAddress;

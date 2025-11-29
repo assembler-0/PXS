@@ -28,6 +28,7 @@ typedef struct {
     CHAR16 InitrdPath[256];
     CHAR8  CmdLine[512];
     UINTN  Timeout;
+    UINT64 KvBase;
     BOOLEAN KaslrEnabled;
 } PXS_CONFIG;
 
@@ -201,6 +202,7 @@ VOID LoadConfig(
     Config->InitrdPath[0] = L'\0';
     Config->CmdLine[0] = '\0';
     Config->Timeout = 3;
+    Config->KvBase = 0;
     Config->KaslrEnabled = TRUE;
 
     Status = LoadFile(RootDir, ConfigName, &Buffer, &Size);
@@ -270,6 +272,30 @@ VOID LoadConfig(
                 }
                 Config->Timeout = TimeoutVal;
             }
+            // Check for KVBASE=
+            else if (AsciiStrnCmp(&AsciiBuffer[Start], "KVBASE=", 7) == 0) {
+                UINTN ValStart = Start + 7;
+                UINTN ValLen = End - ValStart;
+                UINT64 BaseVal = 0;
+                // Skip potential 0x prefix
+                if (ValLen >= 2 && AsciiBuffer[ValStart] == '0' && (AsciiBuffer[ValStart+1] == 'x' || AsciiBuffer[ValStart+1] == 'X')) {
+                    ValStart += 2;
+                    ValLen -= 2;
+                }
+                for (UINTN i = 0; i < ValLen; i++) {
+                    CHAR8 c = AsciiBuffer[ValStart + i];
+                    if (c >= '0' && c <= '9') {
+                        BaseVal = (BaseVal << 4) | (c - '0');
+                    } else if (c >= 'a' && c <= 'f') {
+                        BaseVal = (BaseVal << 4) | (c - 'a' + 10);
+                    } else if (c >= 'A' && c <= 'F') {
+                        BaseVal = (BaseVal << 4) | (c - 'A' + 10);
+                    } else {
+                        break;
+                    }
+                }
+                Config->KvBase = BaseVal;
+            }
             // Check for KASLR=
             else if (AsciiStrnCmp(&AsciiBuffer[Start], "KASLR=", 6) == 0) {
                 UINTN ValStart = Start + 6;
@@ -306,7 +332,8 @@ EFI_STATUS LoadElfKernel(
     IN PXS_CONFIG *Config,
     OUT EFI_PHYSICAL_ADDRESS *EntryPoint,
     OUT UINT64 *KernelBase,
-    OUT UINT64 *KernelSize
+    OUT UINT64 *KernelSize,
+    OUT UINT64 *KernelSlide
 ) {
     EFI_STATUS Status;
     UINT64 FileSize;
@@ -389,7 +416,6 @@ EFI_STATUS LoadElfKernel(
                         LoadBase = Candidate;
                         Slide = LoadBase - BaseOffset;
                         KaslrSuccess = TRUE;
-                        Print(L"KASLR: Loaded at 0x%lx (Slide: 0x%lx)\n", LoadBase, Slide);
                         break;
                     }
                 }
@@ -428,6 +454,7 @@ EFI_STATUS LoadElfKernel(
     }
     *EntryPoint = Ehdr->e_entry + Slide;
     *KernelBase = LoadBase;
+    *KernelSlide = Config->KvBase + Slide;
     SetMem(FileBuffer, FileSize, 0); // Secure wipe
     FreePool(FileBuffer);
     return EFI_SUCCESS;
@@ -516,7 +543,13 @@ EFI_STATUS EFIAPI UefiMain(
     }
 
     // 5. Load Kernel
-    Status = LoadElfKernel(RootDir, &Config, &KernelEntry, &BootInfo->KernelPhysicalBase, &BootInfo->KernelFileSize);
+    Status = LoadElfKernel(RootDir,
+        &Config,
+        &KernelEntry,
+        &BootInfo->KernelPhysicalBase,
+        &BootInfo->KernelFileSize,
+        &BootInfo->KernelVirtualBase
+    );
     if (EFI_ERROR(Status)) {
         FatalError(L"Failed to load kernel", Status);
     }
@@ -565,7 +598,6 @@ EFI_STATUS EFIAPI UefiMain(
         Print(L"SMBIOS found at 0x%lx\n", (UINT64)BootInfo->Smbios);
     }
 
-    Print(L"Kernel loaded at 0x%lx (Entry: 0x%lx)\n", BootInfo->KernelPhysicalBase, KernelEntry);
     Print(L"Preparing for exit...\n");
 
     if (Config.Timeout > 0) {
